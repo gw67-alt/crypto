@@ -1,6 +1,10 @@
 import time
 
-def sha256(message):
+def mult_sha256(message):
+    """
+    SHA-256 implementation using primarily multiplication operations
+    instead of bitwise operations where possible.
+    """
     # SHA-256 Constants
     k = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -23,22 +27,123 @@ def sha256(message):
     h6 = 0x1f83d9ab
     h7 = 0x5be0cd19
     
-    # Helper functions
-    def right_shift(x, n):
-        # Right shift using division by powers of 2
+    # ----- Multiplication-based Bit Operations -----
+    
+    def mult_right_shift(x, n):
+        """Right shift using division by powers of 2"""
         return int(x // (2 ** n))
     
-    def left_shift(x, n):
-        # Left shift using multiplication by powers of 2
+    def mult_left_shift(x, n):
+        """Left shift using multiplication by powers of 2"""
         return int(x * (2 ** n)) & 0xFFFFFFFF
     
-    def right_rotate(x, n):
-        # Right rotation using both operations
-        right_part = right_shift(x, n)
-        left_part = left_shift(x, (32 - n))
-        return (right_part | left_part) & 0xFFFFFFFF
+    def mult_and(a, b):
+        """
+        Implement AND using multiplication
+        For binary values, a AND b = a * b
+        Need to process bit by bit for multi-bit values
+        """
+        result = 0
+        mask = 1
+        
+        for _ in range(32):  # 32-bit integers
+            bit_a = 1 if (a & mask) != 0 else 0
+            bit_b = 1 if (b & mask) != 0 else 0
+            
+            # AND is simply a * b for binary bits
+            bit_result = (bit_a * bit_b) * mask
+            
+            # Add to result
+            result += bit_result
+            
+            # Move to next bit
+            mask *= 2
+            
+        return result
+    
+    def mult_or(a, b):
+        """
+        Implement OR using multiplication and addition
+        For binary values, a OR b = a + b - (a * b)
+        Need to process bit by bit for multi-bit values
+        """
+        result = 0
+        mask = 1
+        
+        for _ in range(32):  # 32-bit integers
+            bit_a = 1 if (a & mask) != 0 else 0
+            bit_b = 1 if (b & mask) != 0 else 0
+            
+            # OR formula: a + b - (a * b) for binary bits
+            bit_result = (bit_a + bit_b - (bit_a * bit_b)) * mask
+            
+            # Add to result
+            result += bit_result
+            
+            # Move to next bit
+            mask *= 2
+            
+        return result
+    
+    def mult_xor(a, b):
+        """
+        Implement XOR using multiplication, addition, and subtraction
+        For binary values, a XOR b = a + b - 2*(a * b)
+        Need to process bit by bit for multi-bit values
+        """
+        result = 0
+        mask = 1
+        
+        for _ in range(32):  # 32-bit integers
+            bit_a = 1 if (a & mask) != 0 else 0
+            bit_b = 1 if (b & mask) != 0 else 0
+            
+            # XOR formula: a + b - 2*(a * b) for binary bits
+            bit_result = (bit_a + bit_b - 2 * (bit_a * bit_b)) * mask
+            
+            # Add to result
+            result += bit_result
+            
+            # Move to next bit
+            mask *= 2
+            
+        return result & 0xFFFFFFFF
+    
+    def mult_not(a):
+        """
+        Implement NOT using subtraction
+        For binary values, NOT a = 1 - a
+        Need to process bit by bit for multi-bit values
+        """
+        result = 0
+        mask = 1
+        
+        for _ in range(32):  # 32-bit integers
+            bit_a = 1 if (a & mask) != 0 else 0
+            
+            # NOT formula: 1 - a for binary bits
+            bit_result = (1 - bit_a) * mask
+            
+            # Add to result
+            result += bit_result
+            
+            # Move to next bit
+            mask *= 2
+            
+        return result & 0xFFFFFFFF
+    
+    def mult_rotate_right(x, n):
+        """
+        Right rotation using multiplication-based shifts
+        """
+        right_part = mult_right_shift(x, n)
+        left_part = mult_left_shift(x, (32 - n))
+        return mult_or(right_part, left_part) & 0xFFFFFFFF
+    
+    # ----- Message Preprocessing -----
     
     def preprocessing(message):
+        """Convert message to padded bit array"""
         # Convert message to binary
         if isinstance(message, str):
             message = message.encode()
@@ -47,7 +152,7 @@ def sha256(message):
         bits = []
         for byte in message:
             for i in range(8):
-                bits.append(right_shift(byte, (7 - i)) & 1)
+                bits.append(mult_right_shift(byte, (7 - i)) & 1)
         
         # Original message length in bits
         original_length = len(bits)
@@ -61,9 +166,11 @@ def sha256(message):
         
         # Append 64 bits representing the original length
         for i in range(64):
-            bits.append(right_shift(original_length, (63 - i)) & 1)
+            bits.append(mult_right_shift(original_length, (63 - i)) & 1)
         
         return bits
+    
+    # ----- Main SHA-256 Algorithm -----
     
     # Process the message
     bits = preprocessing(message)
@@ -80,13 +187,20 @@ def sha256(message):
         for i in range(16):
             word = 0
             for j in range(32):
-                word = left_shift(word, 1) | chunk[i * 32 + j]
+                word = mult_left_shift(word, 1) | chunk[i * 32 + j]
             w.append(word)
         
         # Extend to 64 words
         for i in range(16, 64):
-            s0 = right_rotate(w[i-15], 7) ^ right_rotate(w[i-15], 18) ^ right_shift(w[i-15], 3)
-            s1 = right_rotate(w[i-2], 17) ^ right_rotate(w[i-2], 19) ^ right_shift(w[i-2], 10)
+            # Use multiplication-based operations
+            s0 = mult_xor(mult_rotate_right(w[i-15], 7), 
+                         mult_xor(mult_rotate_right(w[i-15], 18), 
+                                 mult_right_shift(w[i-15], 3)))
+            
+            s1 = mult_xor(mult_rotate_right(w[i-2], 17), 
+                         mult_xor(mult_rotate_right(w[i-2], 19), 
+                                 mult_right_shift(w[i-2], 10)))
+            
             w.append((w[i-16] + s0 + w[i-7] + s1) & 0xFFFFFFFF)
         
         # Initialize working variables
@@ -94,11 +208,25 @@ def sha256(message):
         
         # Compression function main loop
         for i in range(64):
-            S1 = right_rotate(e, 6) ^ right_rotate(e, 11) ^ right_rotate(e, 25)
-            ch = (e & f) ^ ((~e) & g)
+            # Use multiplication-based operations
+            S1 = mult_xor(mult_rotate_right(e, 6), 
+                         mult_xor(mult_rotate_right(e, 11), 
+                                 mult_rotate_right(e, 25)))
+            
+            # ch = (e & f) ^ ((~e) & g)
+            ch = mult_xor(mult_and(e, f), mult_and(mult_not(e), g))
+            
             temp1 = (h + S1 + ch + k[i] + w[i]) & 0xFFFFFFFF
-            S0 = right_rotate(a, 2) ^ right_rotate(a, 13) ^ right_rotate(a, 22)
-            maj = (a & b) ^ (a & c) ^ (b & c)
+            
+            S0 = mult_xor(mult_rotate_right(a, 2), 
+                         mult_xor(mult_rotate_right(a, 13), 
+                                 mult_rotate_right(a, 22)))
+            
+            # maj = (a & b) ^ (a & c) ^ (b & c)
+            maj = mult_xor(mult_and(a, b), 
+                          mult_xor(mult_and(a, c), 
+                                  mult_and(b, c)))
+            
             temp2 = (S0 + maj) & 0xFFFFFFFF
             
             h = g
@@ -127,29 +255,9 @@ def sha256(message):
     
     return digest
 
-def measure_performance(implementation_name, iterations=1000):
-    test_string = "Hello, world!"
-    
-    # Warm-up
-    sha256(test_string)
-    
-    # Measure performance
-    start_time = time.time()
-    for _ in range(iterations):
-        sha256(test_string)
-    end_time = time.time()
-    
-    total_time = end_time - start_time
-    hashes_per_second = iterations / total_time
-    
-    print(f"{implementation_name} Performance:")
-    print(f"  Total time for {iterations} hashes: {total_time:.4f} seconds")
-    print(f"  Hashes per second: {hashes_per_second:.2f}")
-    
-    return hashes_per_second
-
-# Also create a version with native bit shifts for comparison
-def sha256_native_shifts(message):
+# Standard SHA-256 implementation for comparison
+def standard_sha256(message):
+    """Standard SHA-256 using built-in operators for comparison"""
     # SHA-256 Constants
     k = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -172,11 +280,12 @@ def sha256_native_shifts(message):
     h6 = 0x1f83d9ab
     h7 = 0x5be0cd19
     
-    # Helper function
     def right_rotate(x, y):
+        """Rotate x right by y bits"""
         return ((x >> y) | (x << (32 - y))) & 0xFFFFFFFF
     
     def preprocessing(message):
+        """Convert message to padded bit array"""
         # Convert message to binary
         if isinstance(message, str):
             message = message.encode()
@@ -265,28 +374,43 @@ def sha256_native_shifts(message):
     
     return digest
 
-# Example usage
 if __name__ == "__main__":
-    test_string = "Hello, world!"
+    # Test with a small string first to verify correctness
+    test_message = "A" * 80
     
-    # Verify both implementations produce the same hash
-    hash1 = sha256(test_string)
-    hash2 = sha256_native_shifts(test_string)
+    # Calculate hash with both implementations
+    start_time = time.time()
+    standard_hash = standard_sha256(test_message)
+    standard_time = time.time() - start_time
     
-    print(f"Message: {test_string}")
-    print(f"SHA-256 (multiplication shifts): {hash1}")
-    print(f"SHA-256 (native shifts): {hash2}")
-    print(f"Hashes match: {hash1 == hash2}")
-    print()
+    start_time = time.time()
+    mult_hash = mult_sha256(test_message)
+    mult_time = time.time() - start_time
     
-    # Measure and compare performance
-    iterations = 500  # Adjust based on your system's speed
+    # Print results
+    print(f"Test message: '{test_message}'")
+    print(f"Standard SHA-256: {standard_hash}")
+    print(f"Multiplication SHA-256: {mult_hash}")
+    print(f"Hashes match: {standard_hash == mult_hash}")
+    print(f"Standard time: {standard_time:.6f} seconds")
+    print(f"Multiplication time: {mult_time:.6f} seconds")
+    print(f"Factor: {mult_time / standard_time:.2f}x")
     
-    multiplication_hps = measure_performance("Multiplication-based Shifts", iterations)
-    print()
-    native_hps = measure_performance("Native Bit Shifts", iterations)
+    # Count multiplication operations
+    mult_count = 0
     
-    # Calculate the performance difference
-    speedup = native_hps / multiplication_hps
-    print(f"\nPerformance Comparison:")
-    print(f"  Native bit shifts are {speedup:.7f}x faster than multiplication-based shifts")
+    # Each mult_and, mult_or, mult_xor, mult_not operation
+    # Analyze the S0, S1, ch, and maj calculations in one iteration:
+    # - S0: 3 mult_rotate_right (each with 64 multiplications) + 2 mult_xor (each with 96 multiplications)
+    # - S1: Same as S0
+    # - ch: 1 mult_and (32 multiplications) + 1 mult_not (32 multiplications) + 1 mult_and (32 multiplications) + 1 mult_xor (96 multiplications)
+    # - maj: 3 mult_and (96 multiplications) + 2 mult_xor (192 multiplications)
+    
+    # Simplified estimate of multiplications in one compression function iteration
+    per_iteration_mults = 2*(3*64 + 2*96) + (32 + 32 + 32 + 96) + (96 + 192) 
+    
+    # For a small message with 1 chunk and 64 iterations
+    total_mults = 64 * per_iteration_mults
+    
+    print(f"\nEstimated multiplications in one compression iteration: {per_iteration_mults}")
+    print(f"Estimated total multiplications for small message: {total_mults}")
