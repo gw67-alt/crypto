@@ -589,25 +589,3 @@ if __name__ == "__main__":
     result = extreme_mult_sha256(test_message)
     print(f"Extreme Multiplication SHA-256 of '{test_message}': {result}")
     
-    # Benchmark with very short duration due to extreme slowness
-    print("\nBenchmarking extreme multiplication-based SHA-256...")
-    print("This will be EXTREMELY slow on classical computers - prepare to wait...")
-    
-    extreme_results = benchmark_hashrate(extreme_mult_sha256, 
-                                         message_size=10,  # Very small message size
-                                         duration=0.5,     # Very short duration
-                                         min_iterations=1) # Minimum iterations
-    
-    print(f"Extreme Multiplication-based SHA-256 Hashrate:")
-    print(f"  Hashes per second: {extreme_results['hashes_per_second']:.4f} H/s")
-    print(f"  Average time per hash: {extreme_results['avg_time_per_hash']*1000:.2f} ms")
-    print(f"  Total hashes computed: {extreme_results['total_hashes']}")
-    print(f"  Total benchmark time: {extreme_results['total_time']:.2f} seconds")
-    
-    # Run a simplified PoW test if time permits
-    print("\nRunning extremely simplified PoW test (difficulty=1)...")
-    nonce, hash_result, attempts, time_taken = extreme_simple_pow("Test", 1)
-    print(f"Found nonce: {nonce}")
-    print(f"Hash: {hash_result}")
-    print(f"Attempts: {attempts}")
-    print(f"Time: {time_taken:.2f} seconds")
