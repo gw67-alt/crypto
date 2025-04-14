@@ -1,521 +1,339 @@
-import requests
-import json
-import time
-import hashlib
-import random
-import multiprocessing
-from multiprocessing import Process, Queue # Value, Array not used in this version
-# import ctypes # Not used in this version
-import os
-import sys
-import subprocess # For attempting dependency installation
-
-# --- Helper Class to Fetch Blockchain Info ---
-
-class BitcoinBlockchainFetcher:
+def mult_xor(a, b):
+    """XOR simulation using only multiplication.
+    XOR is true when exactly one of the inputs is true.
+    For each bit: (a * (1-b)) + (b * (1-a)) = a + b - 2*a*b
     """
-    Fetches recent Bitcoin blockchain information from public APIs
-    """
-    def __init__(self, api_providers=None):
-        """
-        Initialize with multiple API providers for redundancy
-
-        Args:
-            api_providers (list, optional): List of API endpoint configurations
-        """
-        if api_providers is None:
-            self.api_providers = [
-                # BlockCypher API (often reliable)
-                {
-                    'url': 'https://api.blockcypher.com/v1/btc/main',
-                    'method': 'get_blockcypher_info'
-                },
-                # Blockchain.info API (alternative)
-                {
-                    'url': 'https://blockchain.info/latestblock',
-                    'method': 'get_blockchain_info'
-                }
-                # Add more potential API providers here if needed
-            ]
-        else:
-            self.api_providers = api_providers
-
-    def _parse_blockchain_info(self, data):
-        """ Parses response from Blockchain.info API. """
-        try:
-            return {
-                'block_height': data.get('height', 0),
-                # Blockchain.info uses 'hash' for the current block, 'prev_block' for the previous hash
-                # For mining, we need the hash of the *latest* block as the 'prev_hash' for the *next* block.
-                # However, the simplest approach for simulation is often to use the latest block's data directly.
-                # Let's assume 'prev_block' is what we need (hash of the block before the latest one).
-                # If mining on top of 'latest', its hash becomes the 'prev_hash'. Let's use 'hash'.
-                'prev_hash': data.get('hash', '0' * 64), # Using latest block hash as prev_hash for next
-                'merkle_root': data.get('mrkl_root', '0' * 64),
-                'timestamp': int(data.get('time', time.time())),
-                'bits': data.get('bits', 0) # Keep as int for now, convert later if needed
-            }
-        except Exception as e:
-            print(f"Error parsing Blockchain.info response: {e}")
-            return None
-
-    def _parse_blockcypher_info(self, data):
-        """ Parses response from BlockCypher API. """
-        try:
-            # dateutil is needed for BlockCypher's ISO timestamp
-            import dateutil.parser
-
-            # BlockCypher gives info on the latest block
-            # Its hash becomes the 'prev_hash' for the block we'd mine next
-            timestamp_str = data.get('time')
-            if timestamp_str:
-                 # Ensure timestamp is timezone-aware before converting
-                dt = dateutil.parser.isoparse(timestamp_str)
-                timestamp = int(dt.timestamp())
-            else:
-                timestamp = int(time.time())
-
-            return {
-                'block_height': data.get('height', 0),
-                'prev_hash': data.get('hash', '0' * 64), # Using latest block hash as prev_hash for next
-                'merkle_root': data.get('merkle_root', '0' * 64),
-                'timestamp': timestamp,
-                'bits': data.get('bits', 0) # Keep as int for now, convert later if needed
-            }
-        except ImportError:
-             print("Error: 'python-dateutil' package needed for BlockCypher timestamp parsing.")
-             print("Please install it: pip install python-dateutil")
-             return None
-        except Exception as e:
-            print(f"Error parsing BlockCypher response: {e}")
-            return None
-
-    def fetch_latest_block_info(self):
-        """
-        Fetch the latest Bitcoin block information, trying multiple providers.
-
-        Returns:
-            dict: Block information or default values if all APIs fail.
-        """
-        latest_info = None
-        for provider in self.api_providers:
-            print(f"Attempting to fetch data from: {provider['url']}")
-            try:
-                response = requests.get(provider['url'], timeout=10)
-                response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-
-                data = response.json()
-
-                if provider['method'] == 'get_blockchain_info':
-                    latest_info = self._parse_blockchain_info(data)
-                elif provider['method'] == 'get_blockcypher_info':
-                    latest_info = self._parse_blockcypher_info(data)
-                # Add more methods for other providers here
-
-                if latest_info:
-                    print(f"Successfully fetched data from {provider['url']}")
-                    # Convert bits to hex string here for consistency
-                    if 'bits' in latest_info and isinstance(latest_info['bits'], int):
-                         latest_info['bits'] = hex(latest_info['bits'])[2:] # Format as hex string '1d00ffff'
-                    return latest_info
-
-            except requests.exceptions.RequestException as e:
-                print(f"Error fetching from {provider['url']}: {e}")
-            except json.JSONDecodeError as e:
-                print(f"Error decoding JSON from {provider['url']}: {e}")
-            except Exception as e:
-                 print(f"An unexpected error occurred with {provider['url']}: {e}")
-
-
-        # If all providers fail, return a default block info
-        print("Warning: Unable to fetch live block information from any provider. Using default values.")
-        return {
-            'block_height': 0,
-            'prev_hash': '0' * 64,
-            'merkle_root': '0' * 64,
-            'timestamp': int(time.time()),
-            'bits': '1d00ffff'  # Default easy difficulty target
-        }
-
-# --- Core Mining Logic ---
-
-class BlockchainSolver:
-    @staticmethod
-    def mine_chunk(prefix, start_nonce, chunk_size, target_zeros, result_queue, process_id):
-        """
-        Mine a chunk of nonce values for a target number of leading zeros (simplified difficulty).
-
-        Args:
-            prefix (str): Blockchain data prefix (simplified representation).
-            start_nonce (int): Starting nonce for this chunk.
-            chunk_size (int): Number of nonces to try in this chunk.
-            target_zeros (int): Number of leading hexadecimal zeros required.
-            result_queue (Queue): Queue to report results back to the main process.
-            process_id (int): Identifier for the process reporting.
-        """
-        current_nonce = start_nonce
-        best_zeros_found_in_chunk = 0
-        best_hash_in_chunk = None
-        best_nonce_in_chunk = start_nonce # Track the nonce corresponding to the best hash
-
-        print(f"[Process {process_id}] Starting chunk from nonce {start_nonce}...")
-
-        for i in range(chunk_size):
-            nonce_to_try = current_nonce
-            # Combine blockchain data prefix with current nonce value
-            guess_string = f"{prefix}{nonce_to_try}"
-
-            # Apply double SHA-256 as used in Bitcoin
-            first_hash = hashlib.sha256(guess_string.encode('utf-8')).digest()
-            current_hash_bytes = hashlib.sha256(first_hash).digest()
-            current_hash_hex = current_hash_bytes.hex() # Get hex representation
-
-            # Count leading zeros (simplified difficulty check)
-            zeros = 0
-            for char in current_hash_hex:
-                if char == '0':
-                    zeros += 1
-                else:
-                    break
-
-            # Check if it meets the target difficulty
-            if zeros >= target_zeros:
-                print(f"[Process {process_id}] Solution FOUND!")
-                result_queue.put({
-                    'found': True,
-                    'nonce': nonce_to_try,
-                    'hash': current_hash_hex,
-                    'zeros': zeros,
-                    'process_id': process_id
-                })
-                return # Solution found, exit this process's task
-
-            # Track the best hash found within this chunk if target not met yet
-            if zeros > best_zeros_found_in_chunk:
-                best_zeros_found_in_chunk = zeros
-                best_hash_in_chunk = current_hash_hex
-                best_nonce_in_chunk = nonce_to_try
-
-            # Increment nonce - Use sequential increment for more realistic simulation
-            current_nonce = (current_nonce + 1) & 0xFFFFFFFF # Wrap around 32-bit unsigned integer range
-
-            # Optional: Add a check to see if the result queue has a solution from another process
-            # This can stop processes faster but adds overhead
-            # if i % 10000 == 0: # Check every N iterations
-            #    if not result_queue.empty():
-            #        print(f"[Process {process_id}] Detected possible solution elsewhere, exiting chunk early.")
-            #        return
-
-
-        # If no solution meeting target_zeros was found in this chunk, report the best attempt
-        print(f"[Process {process_id}] Chunk finished. Best zeros found in chunk: {best_zeros_found_in_chunk}")
-        if best_hash_in_chunk:
-            result_queue.put({
-                'found': False, # Did not meet target_zeros
-                'nonce': best_nonce_in_chunk, # Nonce for the best hash found
-                'hash': best_hash_in_chunk,
-                'zeros': best_zeros_found_in_chunk,
-                'process_id': process_id
-            })
-        else:
-             # Should not happen if chunk_size > 0, but handle defensively
-             result_queue.put({
-                'found': False,
-                'zeros': 0,
-                'process_id': process_id
-            })
-
-
-# --- Multi-Process Management ---
-
-class MultiProcessBlockchainMiner:
-    def __init__(self, num_processes=None):
-        """
-        Initialize multi-process blockchain miner.
-
-        Args:
-            num_processes (int, optional): Number of processes to use.
-                                           Defaults to number of CPU cores.
-        """
-        if num_processes is None:
-            try:
-                num_processes = multiprocessing.cpu_count()
-            except NotImplementedError:
-                print("Warning: Could not detect CPU count. Defaulting to 1 process.")
-                num_processes = 1
-        self.num_processes = num_processes
-        print(f"Miner initialized to use {self.num_processes} processes.")
-
-    def mine_block(self, blockchain_prefix, target_zeros, max_iterations_total=10_000_000):
-        """
-        Mine a block using multiple processes seeking a specific number of leading zeros.
-
-        Args:
-            blockchain_prefix (str): Simplified prefix data for the block.
-            target_zeros (int): Number of leading hexadecimal zeros required.
-            max_iterations_total (int): Maximum *total* nonces to try across all processes.
-
-        Returns:
-            dict: Mining result (nonce, hash, etc.) if found within iterations, else None or best attempt.
-        """
-        print(f"\n--- Starting multi-process mining ---")
-        print(f"Target: {target_zeros} leading zeros")
-        print(f"Max total nonces: {max_iterations_total:,}")
-        print(f"Processes: {self.num_processes}")
-        print(f"Prefix data: {blockchain_prefix}")
-
-        result_queue = multiprocessing.Queue()
-        processes = []
-
-        # Calculate nonce chunk size for each process
-        # Ensure chunk_size is at least 1 if max_iterations_total is small
-        chunk_size_per_process = max(1, max_iterations_total // self.num_processes)
-        actual_total_iterations = chunk_size_per_process * self.num_processes
-        print(f"Nonces per process chunk: {chunk_size_per_process:,}")
-        print(f"Actual total nonces to be checked: {actual_total_iterations:,}")
-
-
-        start_time = time.time()
-        overall_best_result = {'found': False, 'zeros': -1} # Track best result if target not met
-
-
-        # Create and start processes
-        for i in range(self.num_processes):
-            # Assign a unique starting nonce for each process to avoid overlap
-            # Use a large random offset multiplied by process index for better distribution
-            start_nonce = random.randint(0, 0xFFFFFFFF) # Each process starts randomly
-            # Alternative: start_nonce = (i * chunk_size_per_process) & 0xFFFFFFFF # Sequential chunks
-
-            p = multiprocessing.Process(
-                target=BlockchainSolver.mine_chunk,
-                args=(blockchain_prefix, start_nonce, chunk_size_per_process, target_zeros, result_queue, i)
-            )
-            processes.append(p)
-            p.start()
-            print(f"Started process {i} with start_nonce {start_nonce}")
-
-        # Wait for results
-        solution_found = None
-        results_received = 0
-        while results_received < self.num_processes:
-            try:
-                # Wait for a result from any process
-                result = result_queue.get(timeout=1) # Use timeout to allow periodic checks/updates
-                results_received += 1
-                print(f"Result received from process {result.get('process_id', 'N/A')}. "
-                      f"Found: {result.get('found')}, Zeros: {result.get('zeros', 'N/A')}. "
-                      f"({results_received}/{self.num_processes} processes finished)")
-
-
-                if result['found']: # Check if this result meets the target
-                    solution_found = result
-                    print(f"\nSOLUTION FOUND by process {solution_found['process_id']}!")
-                    break # Exit the loop as soon as a solution is found
-                else:
-                    # If target not met, track the best result seen so far
-                     if result.get('zeros', -1) > overall_best_result['zeros']:
-                         overall_best_result = result
-
-            except multiprocessing.queues.Empty:
-                 # Timeout occurred, check if processes are still alive
-                 if not any(p.is_alive() for p in processes):
-                     print("All processes seem to have finished or terminated unexpectedly.")
-                     break
-                 # Optional: Print a status update during long runs
-                 # elapsed = time.time() - start_time
-                 # print(f"Mining... {elapsed:.1f}s elapsed. {results_received}/{self.num_processes} chunks done.")
-                 continue # Continue waiting if processes are alive and no result yet
-
-        # Cleanup: Terminate any remaining processes forcefully if a solution was found
-        if solution_found:
-            print("Terminating remaining processes...")
-            for i, p in enumerate(processes):
-                if p.is_alive():
-                    print(f"Terminating process {i}...")
-                    p.terminate() # Forcefully stop
-                    p.join(timeout=1) # Wait briefly for termination
-                    if p.is_alive():
-                         print(f"Warning: Process {i} did not terminate gracefully.")
-        else:
-             print("No solution found meeting the target. Waiting for all processes to join naturally...")
-             # Ensure all processes have finished cleanly if no solution was found
-             for i, p in enumerate(processes):
-                 p.join() # Wait for process to complete its chunk
-                 print(f"Process {i} joined.")
-
-
-        end_time = time.time()
-        duration = end_time - start_time
-        # Calculate hashrate based on the actual number of hashes performed
-        total_hashes_calculated = actual_total_iterations if not solution_found else "N/A (stopped early)" # Approximat
-        hashrate = (actual_total_iterations / duration) if duration > 0 else 0
-
-        print("\n--- Mining Finished ---")
-        if solution_found:
-            print("===== BLOCK FOUND! =====")
-            print(f"Nonce: {solution_found['nonce']}")
-            print(f"Hash: {solution_found['hash']}")
-            print(f"Leading zeros: {solution_found['zeros']} (Target: >= {target_zeros})")
-            print(f"Found by Process: {solution_found['process_id']}")
-        elif overall_best_result['zeros'] != -1:
-             print("===== TARGET NOT REACHED =====")
-             print("Best attempt:")
-             print(f"Nonce: {overall_best_result['nonce']}")
-             print(f"Hash: {overall_best_result['hash']}")
-             print(f"Leading zeros: {overall_best_result['zeros']} (Target: >= {target_zeros})")
-             print(f"Found by Process: {overall_best_result['process_id']}")
-        else:
-            print("===== TARGET NOT REACHED (No valid hashes reported) =====")
-
-
-        print(f"\nMining stats:")
-        print(f"Time spent: {duration:.2f} seconds")
-        print(f"Total nonces checked: {total_hashes_calculated}")
-        print(f"Approximate Hashrate: {hashrate:,.0f} H/s") # Hashes per second
-
-        return solution_found if solution_found else overall_best_result # Return solution or best attempt
-
-# --- Simulation Orchestrator ---
-
-class BlockchainMiningSimulator:
-    """
-    Simulates the Bitcoin mining process using fetched data and multi-processing.
-    Uses a simplified block data representation and difficulty check (leading zeros).
-    """
-    def __init__(self):
-        self.fetcher = BitcoinBlockchainFetcher()
-        self.miner = MultiProcessBlockchainMiner() # Uses cpu_count by default
-
-    def prepare_mining_data_prefix(self, block_info):
-        """
-        Prepare the simplified blockchain data prefix string for mining simulation.
-        NOTE: This is a highly simplified representation, not the actual binary header.
-
-        Args:
-            block_info (dict): Block information fetched from API.
-
-        Returns:
-            str: Prepared blockchain data prefix string.
-        """
-        # Extract necessary components, providing defaults
-        # Use the hash of the latest block as the 'previous hash' for the block we are trying to mine
-        prev_hash = block_info.get('prev_hash', '0' * 64)
-        merkle_root = block_info.get('merkle_root', '0' * 64)
-        timestamp = str(block_info.get('timestamp', int(time.time())))
-        bits = str(block_info.get('bits', '1d00ffff')) # Already converted to hex string by fetcher
-
-        # --- SIMPLIFICATION ---
-        # Create a shortened string representation for the simulation prefix.
-        # Real mining hashes the 80-byte binary header.
-        prefix_prev_hash = prev_hash[:16] # Use more bytes for better simulation
-        prefix_merkle_root = merkle_root[:16]
-        # Combine components into the prefix string. Nonce will be appended later.
-        blockchain_prefix = f"{prefix_prev_hash}{prefix_merkle_root}{timestamp}{bits}"
-        # --------------------
-
-        print("\n===== Preparing Mining Data (Simplified Prefix) =====")
-        print(f"Using Previous Block Hash (truncated): {prefix_prev_hash}...")
-        print(f"Using Merkle Root (truncated): {prefix_merkle_root}...")
-        print(f"Using Timestamp: {timestamp}")
-        print(f"Using Bits (difficulty): {bits}")
-        print(f"Full Prefix String for Hashing: {blockchain_prefix}") # Show the actual prefix
-
-        return blockchain_prefix
-
-    def run_mining_simulation(self, difficulties_to_try=None, iterations_per_difficulty=None):
-        """
-        Run the mining simulation loop for different simplified difficulties.
-
-        Args:
-            difficulties_to_try (list, optional): List of target leading zeros to attempt.
-                                                  Defaults to [2, 3, 4, 5].
-            iterations_per_difficulty (int, optional): Base number of iterations for the easiest difficulty.
-                                                       Adjusted automatically for harder difficulties.
-                                                       Defaults to 1,000,000.
-        """
-        print("Starting Bitcoin Block Mining Simulation...")
-        print("Fetching latest block information...")
-
-        block_info = self.fetcher.fetch_latest_block_info()
-
-        print("\n===== Fetched Block Information =====")
-        if block_info:
-             # Print fetched info nicely
-            print(f"  Block Height: {block_info.get('block_height', 'N/A')}")
-            print(f"  Prev Block Hash: {block_info.get('prev_hash', 'N/A')}")
-            print(f"  Merkle Root: {block_info.get('merkle_root', 'N/A')}")
-            print(f"  Timestamp: {block_info.get('timestamp', 'N/A')}")
-            print(f"  Bits (Difficulty): {block_info.get('bits', 'N/A')}")
-
-            blockchain_prefix = self.prepare_mining_data_prefix(block_info)
-
-            iterations_per_difficulty = 1_000_000_000 # Base iterations for easiest target
-            target_zeros = 7
-
-            while True:
-                 # Rough adjustment of iterations based on difficulty (each extra zero is ~16x harder)
-                 # This scaling factor is approximate for leading hex zeros
-                 scaling_factor = 16 ** (target_zeros)
-                 max_total_iterations = int(iterations_per_difficulty * scaling_factor)
-
-                 # Call the multi-process miner
-                 result = self.miner.mine_block(
-                     blockchain_prefix,
-                     target_zeros,
-                     max_total_iterations
-                 )
-
-                 # Optional: Add a pause or check if user wants to continue
-                 # input(f"\nPress Enter to attempt next difficulty level (or Ctrl+C to stop)...")
-
-        else:
-            print("Could not run simulation as block information fetch failed.")
-
-# --- Main Execution ---
-
-def main():
-    """
-    Main execution function for the Bitcoin mining simulation.
-    """
-    print("======================================")
-    print(" Bitcoin Block Mining Simulator (CPU)")
-    print("======================================")
-    print("Note: This script simulates the hashing process but does not interact")
-    print("      with the live Bitcoin network or generate real rewards.")
-    print("      It uses simplified data structures and difficulty checks.")
-    print("-" * 38)
-
-    # --- Dependency Check ---
-    # Check for requests and python-dateutil, attempt install if missing
-    try:
-        import requests
-        # Check for dateutil specifically, as it's conditionally imported later
-        import dateutil.parser
-        print("Required libraries (requests, python-dateutil) are installed.")
-    except ImportError:
-        print("One or more required libraries ('requests', 'python-dateutil') not found.")
-        try:
-            print("Attempting to install missing libraries using pip...")
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'requests', 'python-dateutil'])
-            print("Libraries installed successfully. Please re-run the script.")
-            # Exit after attempting install, user needs to restart
-            sys.exit(0)
-        except Exception as e:
-            print(f"Error: Failed to install libraries automatically: {e}")
-            print("Please install them manually:")
-            print("  pip install requests python-dateutil")
-            sys.exit(1) # Exit if dependencies cannot be installed
-
-    # --- Run Simulation ---
-    simulator = BlockchainMiningSimulator()
-    # You can customize the difficulties and base iterations here:
-    # e.g., simulator.run_mining_simulation(difficulties_to_try=[4, 5], iterations_per_difficulty=5000000)
-    simulator.run_mining_simulation()
-
-    print("\nSimulation finished.")
+    result = 0
+    mask = 1
+    
+    for i in range(32):
+        # Extract bits using division and modulo
+        a_bit = (a % (mask * 2)) // mask
+        b_bit = (b % (mask * 2)) // mask
+        
+        # XOR formula: a + b - 2*a*b
+        result_bit = a_bit + b_bit - 2 * a_bit * b_bit
+        
+        # Set the bit using addition and multiplication
+        result = result + result_bit * mask
+        
+        # Move to next bit position
+        mask = mask * 2
+    
+    # Ensure result is a 32-bit unsigned integer
+    return result & 0xFFFFFFFF
+
+
+def mult_and(a, b):
+    """AND simulation using only multiplication."""
+    result = 0
+    mask = 1
+    
+    for i in range(32):
+        # Extract bits using division and modulo
+        a_bit = (a % (mask * 2)) // mask
+        b_bit = (b % (mask * 2)) // mask
+        
+        # AND is simply multiplication of bits
+        result_bit = a_bit * b_bit
+        
+        # Set the bit using addition and multiplication
+        result = result + result_bit * mask
+        
+        # Move to next bit position
+        mask = mask * 2
+    
+    return result & 0xFFFFFFFF
+
+
+def mult_not(a):
+    """NOT simulation using only multiplication."""
+    result = 0
+    mask = 1
+    
+    for i in range(32):
+        # Extract bit using division and modulo
+        a_bit = (a % (mask * 2)) // mask
+        
+        # NOT is 1 - bit
+        result_bit = 1 - a_bit
+        
+        # Set the bit using addition and multiplication
+        result = result + result_bit * mask
+        
+        # Move to next bit position
+        mask = mask * 2
+    
+    return result & 0xFFFFFFFF
+
+
+def mult_or(a, b):
+    """OR simulation using only multiplication."""
+    result = 0
+    mask = 1
+    
+    for i in range(32):
+        # Extract bits using division and modulo
+        a_bit = (a % (mask * 2)) // mask
+        b_bit = (b % (mask * 2)) // mask
+        
+        # OR using multiplication: 1-(1-a)*(1-b) = a+b-a*b
+        result_bit = a_bit + b_bit - a_bit * b_bit
+        
+        # Set the bit using addition and multiplication
+        result = result + result_bit * mask
+        
+        # Move to next bit position
+        mask = mask * 2
+    
+    return result & 0xFFFFFFFF
+
+
+def mult_add(a, b):
+    """Addition simulation using only multiplication."""
+    result = 0
+    carry = 0
+    mask = 1
+    
+    for i in range(32):
+        # Extract bits using division and modulo
+        a_bit = (a % (mask * 2)) // mask
+        b_bit = (b % (mask * 2)) // mask
+        
+        # Sum bit = a ⊕ b ⊕ carry
+        # Using XOR implementation: a + b - 2*a*b
+        sum_bit = (a_bit + b_bit + carry - 2 * a_bit * b_bit - 2 * a_bit * carry - 2 * b_bit * carry + 4 * a_bit * b_bit * carry) % 2
+        
+        # Next carry = (a AND b) OR (carry AND (a XOR b))
+        temp_xor = a_bit + b_bit - 2 * a_bit * b_bit
+        carry = a_bit * b_bit + carry * temp_xor - carry * temp_xor * a_bit * b_bit
+        
+        # Set the bit using addition and multiplication
+        result = result + sum_bit * mask
+        
+        # Move to next bit position
+        mask = mask * 2
+    
+    return result & 0xFFFFFFFF
+
+
+def mult_rotate_right(a, b):
+    """Right rotation simulation using only multiplication."""
+    b = b % 32  # Ensure rotation is within bounds
+    a = a & 0xFFFFFFFF  # Ensure we're working with a 32-bit number
+    
+    result = 0
+    
+    for i in range(32):
+        # For right rotation, we need to look b positions to the right
+        # which means the bit at position i in the result comes from position (i + b) % 32 in the input
+        src_pos = (i + b) % 32
+        
+        # Extract the bit at position src_pos
+        src_mask = 2 ** src_pos
+        bit = (a % (src_mask * 2)) // src_mask
+        
+        # Set the bit at position i in the result
+        dest_mask = 2 ** i
+        result = result + bit * dest_mask
+    
+    return result & 0xFFFFFFFF
+
+
+def mult_shift_right(a, b):
+    """Right shift simulation using only multiplication."""
+    b = min(b, 32)  # Ensure shift is within bounds
+    
+    result = 0
+    
+    for i in range(32 - b):
+        # Calculate source position (i + b)
+        src_pos = i + b
+        
+        # Extract the bit using division and modulo
+        src_mask = 2 ** src_pos
+        bit = (a % (src_mask * 2)) // src_mask
+        
+        # Set the bit using multiplication
+        dest_mask = 2 ** i
+        result = result + bit * dest_mask
+    
+    return result & 0xFFFFFFFF
+
+
+# SHA-256 specific functions
+def ch(x, y, z):
+    """Ch(x, y, z) = (x AND y) XOR ((NOT x) AND z)"""
+    return mult_xor(mult_and(x, y), mult_and(mult_not(x), z))
+
+
+def maj(x, y, z):
+    """Maj(x, y, z) = (x AND y) XOR (x AND z) XOR (y AND z)"""
+    return mult_xor(mult_xor(mult_and(x, y), mult_and(x, z)), mult_and(y, z))
+
+
+def sigma_0(x):
+    """Σ0(x) = ROTR^2(x) XOR ROTR^13(x) XOR ROTR^22(x)"""
+    return mult_xor(mult_xor(mult_rotate_right(x, 2), mult_rotate_right(x, 13)), mult_rotate_right(x, 22))
+
+
+def sigma_1(x):
+    """Σ1(x) = ROTR^6(x) XOR ROTR^11(x) XOR ROTR^25(x)"""
+    return mult_xor(mult_xor(mult_rotate_right(x, 6), mult_rotate_right(x, 11)), mult_rotate_right(x, 25))
+
+
+def sigma_0_small(x):
+    """σ0(x) = ROTR^7(x) XOR ROTR^18(x) XOR SHR^3(x)"""
+    return mult_xor(mult_xor(mult_rotate_right(x, 7), mult_rotate_right(x, 18)), mult_shift_right(x, 3))
+
+
+def sigma_1_small(x):
+    """σ1(x) = ROTR^17(x) XOR ROTR^19(x) XOR SHR^10(x)"""
+    return mult_xor(mult_xor(mult_rotate_right(x, 17), mult_rotate_right(x, 19)), mult_shift_right(x, 10))
+
+
+def string_to_bytes(message):
+    """Convert string to UTF-8 encoded bytes."""
+    if isinstance(message, str):
+        return message.encode('utf-8')
+    return message
+
+
+def bytes_to_hex(bytes_array):
+    """Convert bytes to hex string using multiplication."""
+    hex_chars = '0123456789abcdef'
+    hex_string = ''
+    
+    for byte in bytes_array:
+        first_char = hex_chars[byte // 16]
+        second_char = hex_chars[byte % 16]
+        hex_string += first_char + second_char
+    
+    return hex_string
+
+
+def mult_sha256(message):
+    """SHA-256 implementation using only multiplication operations."""
+    # Constants (first 32 bits of the fractional parts of the cube roots of the first 64 primes)
+    k = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ]
+    
+    # Initial hash values (first 32 bits of the fractional parts of the square roots of the first 8 primes)
+    h = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    ]
+    
+    # Pre-processing
+    msg_bytes = bytearray(string_to_bytes(message))
+    msg_bits = len(msg_bytes) * 8
+    
+    # Append the bit '1' to the message
+    msg_bytes.append(128)  # 128 = 0x80, using decimal instead of hex
+    
+    # Append '0' bits until message length ≡ 448 (mod 512)
+    while (len(msg_bytes) * 8) % 512 != 448:
+        msg_bytes.append(0)
+    
+    # Append length of message (64-bit big-endian integer)
+    msg_bits_array = []
+    for i in range(8):
+        # Use division instead of bit shifting
+        msg_bits_array.append((msg_bits // (2 ** (56 - i * 8))) % 256)
+    
+    msg_bytes.extend(msg_bits_array)
+    
+    # Process the message in 512-bit chunks
+    for chunk_start in range(0, len(msg_bytes), 64):
+        chunk = msg_bytes[chunk_start:chunk_start + 64]
+        
+        # Prepare the message schedule using multiplication instead of bit shifts
+        w = [0] * 64
+        
+        for t in range(16):
+            w[t] = (chunk[t * 4] * 16777216 +     # 2^24
+                    chunk[t * 4 + 1] * 65536 +     # 2^16
+                    chunk[t * 4 + 2] * 256 +       # 2^8
+                    chunk[t * 4 + 3])
+        
+        for t in range(16, 64):
+            w[t] = mult_add(mult_add(sigma_1_small(w[t - 2]), w[t - 7]), 
+                          mult_add(sigma_0_small(w[t - 15]), w[t - 16]))
+        
+        # Initialize working variables
+        a, b, c, d, e, f, g, h_val = h
+        
+        # Main loop
+        for t in range(64):
+            t1 = mult_add(mult_add(mult_add(mult_add(h_val, sigma_1(e)), ch(e, f, g)), k[t]), w[t])
+            t2 = mult_add(sigma_0(a), maj(a, b, c))
+            
+            h_val = g
+            g = f
+            f = e
+            e = mult_add(d, t1)
+            d = c
+            c = b
+            b = a
+            a = mult_add(t1, t2)
+        
+        # Update hash values
+        h[0] = mult_add(a, h[0]) & 0xFFFFFFFF
+        h[1] = mult_add(b, h[1]) & 0xFFFFFFFF
+        h[2] = mult_add(c, h[2]) & 0xFFFFFFFF
+        h[3] = mult_add(d, h[3]) & 0xFFFFFFFF
+        h[4] = mult_add(e, h[4]) & 0xFFFFFFFF
+        h[5] = mult_add(f, h[5]) & 0xFFFFFFFF
+        h[6] = mult_add(g, h[6]) & 0xFFFFFFFF
+        h[7] = mult_add(h_val, h[7]) & 0xFFFFFFFF
+    
+    # Produce the final hash value using multiplication and division
+    hash_bytes = []
+    for word in h:
+        # Extract bytes using division and modulo
+        hash_bytes.append((word // 16777216) % 256)    # First byte (most significant)
+        hash_bytes.append((word // 65536) % 256)       # Second byte
+        hash_bytes.append((word // 256) % 256)         # Third byte
+        hash_bytes.append(word % 256)                  # Fourth byte (least significant)
+    
+    return bytes_to_hex(hash_bytes)
+
+
+def test_sha256():
+    """Test the SHA-256 implementation with known test vectors."""
+    import hashlib  # Import for verification
+    
+    test_cases = [
+        {"input": "", "expected": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+        {"input": "abc", "expected": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},
+        {"input": "hello world", "expected": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"}
+    ]
+    
+    print("Testing SHA-256 implementation using only multiplication operations:")
+    print("="*80)
+    
+    for test in test_cases:
+        # Calculate using our multiplication-based implementation
+        result = mult_sha256(test["input"])
+        
+        # Calculate using Python's hashlib for verification
+        std_result = hashlib.sha256(string_to_bytes(test["input"])).hexdigest()
+        
+        print(f"Input: '{test['input']}'")
+        print(f"Expected:      {test['expected']}")
+        print(f"Our Result:    {result}")
+        print(f"Hashlib:       {std_result}")
+        print(f"Match Expected: {result == test['expected']}")
+        print(f"Match Hashlib:  {result == std_result}")
+        print("-"*80)
 
 
 if __name__ == "__main__":
-    # Crucial for Windows compatibility when using multiprocessing
-    multiprocessing.freeze_support()
-    main()
+    test_sha256()
